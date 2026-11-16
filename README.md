@@ -2,7 +2,7 @@
 
 **Live Application:** [https://crypto-market-analysis-chatbot.streamlit.app/](https://crypto-market-analysis-chatbot.streamlit.app/)
 
-PulseCrypto is an end to end data engineering pipeline and interactive market analytics platform built using Python, Amazon S3, Databricks Delta Lake, PySpark, Groq, and Streamlit. The project automates daily ingestion of market data for the top 250 cryptocurrencies, transforms raw JSON payloads through a three tier Medallion architecture (Bronze, Silver, and Gold), computes rolling technical indicators, and powers a dark mode analytics dashboard with an AI market analyst grounded in the Gold tables.
+PulseCrypto is an end to end data engineering pipeline and interactive market analytics platform built with Python, Amazon S3, Databricks Delta Lake, PySpark, Groq, and Streamlit. The system extracts daily market snapshots for the top 250 cryptocurrencies from the CoinGecko API, lands raw JSON files in Amazon S3, processes the data through a three tier Medallion architecture (Bronze, Silver, and Gold) in Databricks, computes rolling 7 day technical indicators, and powers a dark mode analytics terminal with an interactive AI market analyst.
 
 ---
 
@@ -10,10 +10,11 @@ PulseCrypto is an end to end data engineering pipeline and interactive market an
 
 ```text
 +-------------------+       +---------------------------------------+
-|  CoinGecko API    | ----> | GitHub Actions (Daily Cron 02:00 UTC) |
-| (/coins/markets)  |       +-------------------+-------------------+
-+-------------------+                           |
-                                                v
+|  CoinGecko API    | ----> | Python Extraction Script              |
+| (/coins/markets)  |       | (src/extraction/ingest_coingecko.py)  |
++-------------------+       +-------------------+-------------------+
+                                                |
+                                                v  (boto3 upload)
                             +---------------------------------------+
                             | Amazon S3 Raw Data Lake               |
                             | s3://crypto-lakehouse-raw/raw/        |
@@ -39,7 +40,7 @@ PulseCrypto is an end to end data engineering pipeline and interactive market an
                                        v  (databricks-sql-connector)
 +---------------------------------------------------------------------------+
 | Streamlit Serving Layer ([https://crypto-market-analysis-chatbot.streamlit.app/](https://crypto-market-analysis-chatbot.streamlit.app/))
-|  * Executive KPI Cards & Animated SVG Charts (Breadth Gauge & Donut)      |
+|  * 8 Executive KPI Cards & Animated SVG Charts (Breadth Gauge & Donut)    |
 |  * Deterministic Market Regime Outlook (Groq API, temperature=0, seed=42) |
 |  * Interactive Market Analyst Q&A grounded in Top 200 Gold metrics        |
 +---------------------------------------------------------------------------+
@@ -47,35 +48,42 @@ PulseCrypto is an end to end data engineering pipeline and interactive market an
 
 ---
 
-## Step by Step Pipeline Walkthrough
+## End to End Pipeline Breakdown
 
-### Step 1: Automated Data Extraction (`src/extraction/ingest_coingecko.py`)
-* **What it does:** Sends a GET request to the CoinGecko `/coins/markets` endpoint (`vs_currency=usd`, `order=market_cap_desc`, `per_page=250`, `page=1`) to capture live prices, 24 hour percentage changes, market capitalizations, trading volumes, and rankings for the top 250 digital assets.
-* **Storage format:** Wraps the response with extraction metadata (`extracted_at_utc` and `source`) and uploads it as `market_data.json` into a Hive partitioned Amazon S3 path (`raw/date=YYYY-MM-DD/market_data.json`) using `boto3`.
-* **Scheduling:** A GitHub Actions workflow (`.github/workflows/daily_ingest.yml`) triggers this script automatically every day at `02:00 UTC` (`07:30 AM IST`) using encrypted repository secrets for AWS credentials.
+### 1. Data Extraction (`src/extraction/ingest_coingecko.py`)
+* **API Ingestion:** Queries the CoinGecko REST API (`/api/v3/coins/markets`) with `vs_currency=usd`, `order=market_cap_desc`, `per_page=250`, and `page=1` to pull live prices, 24 hour percentage price changes, total market capitalization, 24 hour trading volume, circulating supply, and rank metadata for the top 250 coins.
+* **Payload Envelope:** Wraps the raw coin list inside a structured JSON envelope containing `extracted_at_utc` and `source` metadata so downstream layers can audit when each snapshot was captured.
+* **Hive Style S3 Partitioning:** Uploads the file via `boto3` into `s3://crypto-lakehouse-raw/raw/date=YYYY-MM-DD/market_data.json`. Organizing files by `date=YYYY-MM-DD/` allows Databricks to discover new partitions automatically and avoids overwriting prior days of market history.
 
-### Step 2: Bronze Ingestion via Auto Loader (`src/transformation/01_bronze_crypto.py`)
-* **What it does:** Uses Databricks Auto Loader (`cloudFiles`) to incrementally detect and ingest newly landed JSON files from Amazon S3 into the `crypto_project.crypto.bronze_crypto_market` Delta table.
-* **Why Auto Loader:** Configured with `trigger(availableNow=True)` and S3 checkpointing (`_checkpoints/bronze_crypto`), it processes only unread files in batch mode and shuts down, avoiding continuous streaming cluster costs while maintaining full schema evolution (`schemaEvolutionMode = addNewColumns`).
+### 2. Bronze Layer (`src/transformation/01_bronze_crypto.py`)
+* **Incremental Streaming with Auto Loader:** Uses Databricks Auto Loader (`spark.readStream.format("cloudFiles")`) with `cloudFiles.format = "json"` to detect newly uploaded JSON files in S3 without scanning the entire bucket on every run.
+* **Batch Trigger & Checkpointing:** Configured with `.trigger(availableNow=True)` and `.option("checkpointLocation", "s3://crypto-lakehouse-raw/_checkpoints/bronze_crypto")`. Auto Loader tracks every processed S3 object in the checkpoint directory, ingests only new files in a single batch pass, and terminates cleanly to avoid idle compute costs.
+* **Schema Evolution:** Uses `cloudFiles.schemaEvolutionMode = "addNewColumns"` so any new fields introduced by the CoinGecko API are captured automatically in `crypto_project.crypto.bronze_crypto_market`.
 
-### Step 3: Silver Cleaning & Idempotent Upserts (`src/transformation/02_silver_crypto.py`)
-* **What it does:** Reads new records from Bronze, flattens nested JSON fields, casts numeric columns to strict `double` and `long` types, and filters out invalid or untracked assets (`market_cap > 0` and `price_usd > 0`).
-* **Deduplication & MERGE:** Applies a PySpark `row_number()` window partitioned by `(coin_id, market_date)` and ordered by `ingestion_timestamp DESC` so only the latest record per coin per day survives. It then executes a Delta `MERGE INTO crypto_project.crypto.silver_crypto_market` statement, updating existing records if a day is re run and inserting new records cleanly without duplicates.
+### 3. Silver Layer (`src/transformation/02_silver_crypto.py`)
+* **Schema Enforcement & Filtering:** Flattens the nested Bronze JSON records, casts price, volume, and market cap columns into strict `double` and `long` data types, parses `market_date`, and drops invalid or dead tokens (`market_cap > 0` and `price_usd > 0`).
+* **Window Based Deduplication:** If the extraction script runs multiple times on the same day, duplicate rows can enter Bronze. The Silver transformation applies `row_number().over(Window.partitionBy("coin_id", "market_date").orderBy(col("ingestion_timestamp").desc()))` and filters to `row_num == 1` so only the latest snapshot per coin per day is retained.
+* **Idempotent Delta MERGE:** Executes a Delta Lake `MERGE INTO crypto_project.crypto.silver_crypto_market` keyed on `(target.coin_id = source.coin_id AND target.market_date = source.market_date)`. Matching rows are updated in place and new dates are inserted, making the Silver layer completely idempotent across re runs.
 
-### Step 4: Gold Star Schema & Feature Engineering (`src/transformation/03_gold_crypto.py`)
-* **What it does:** Filters the cleaned Silver dataset down to the Top 200 cryptocurrencies by `market_cap_rank` and builds two production tables:
-  1. **`crypto_project.crypto.dim_coins`:** Dimension table holding descriptive metadata (`coin_id`, `symbol`, `name`, and current `market_cap_rank`).
-  2. **`crypto_project.crypto.fact_crypto_daily`:** Fact table storing daily prices alongside engineered technical indicators computed via PySpark window functions (`partitionBy("coin_id").orderBy("market_date")`):
-     * `prev_price_usd`: Prior day closing price via `lag("price_usd", 1)`.
-     * `sma_7d_price`: 7 day rolling simple moving average via `avg("price_usd").over(rowsBetween(-6, 0))`.
-     * `volatility_7d`: 7 day rolling price standard deviation via `stddev("price_usd").over(rowsBetween(-6, 0))`.
-     * `volume_to_mcap_ratio`: Liquidity turnover ratio (`total_volume / market_cap`).
-     * `trend_signal`: Momentum flag classifying each asset as `ABOVE_7D_SMA`, `BELOW_7D_SMA`, or `NEUTRAL`.
+### 4. Gold Layer (`src/transformation/03_gold_crypto.py`)
+* **Universe Filtering:** Narrows the cleaned Silver dataset to the Top 200 cryptocurrencies by `market_cap_rank` so downstream analytics and AI prompts focus on liquid, actively traded assets.
+* **Dimensional Modeling (Star Schema):**
+  1. **`crypto_project.crypto.dim_coins`:** Stores slowly changing descriptive attributes (`coin_id`, `symbol`, `name`, and current `market_cap_rank`).
+  2. **`crypto_project.crypto.fact_crypto_daily`:** Stores daily quantitative measurements and engineered technical indicators computed over a rolling window (`Window.partitionBy("coin_id").orderBy("market_date").rowsBetween(-6, 0)`):
+     * `prev_price_usd`: Previous day price retrieved via `lag("price_usd", 1)`.
+     * `sma_7d_price`: 7 day rolling simple moving average of closing prices.
+     * `volatility_7d`: 7 day rolling standard deviation of closing prices.
+     * `volume_to_mcap_ratio`: 24 hour trading volume divided by market capitalization to highlight high turnover assets.
+     * `trend_signal`: Momentum classification (`ABOVE_7D_SMA`, `BELOW_7D_SMA`, or `NEUTRAL`) comparing current price against the 7 day moving average.
 
-### Step 5: Serving Layer & AI Market Analyst (`src/dashboard/app.py`)
-* **Live Warehouse Queries:** Connects directly to the Databricks SQL Warehouse via `databricks-sql-connector` with `@st.cache_data(ttl=300)` caching so dashboard interactions remain fast.
-* **Visual Analytics:** Renders 8 executive KPI cards, an animated radial gauge showing 7 day SMA market breadth, a donut ring breaking down capitalization across Large Caps (Rank 1 to 10), Mid Caps (Rank 11 to 50), and Altcoins (Rank 51 to 200), an animated Top 5 Gainers/Losers bar chart, and a Price vs. 7D SMA trend chart.
-* **Deterministic Groq AI Engine:** Compresses the Top 200 snapshot into a compact pipe delimited context block (under 1,800 tokens) containing market breadth metrics, the top 20 assets, top movers, and any ticker mentioned in the user's prompt. Calls the Groq API (`openai/gpt-oss-120b` with fallback to `openai/gpt-oss-20b`) with `temperature=0.0` and `seed=42` so both the Quantitative Market Brief and interactive Q&A produce grounded, repeatable answers without hallucinating external news.
+### 5. Serving Layer & AI Quantitative Terminal (`src/dashboard/app.py`)
+* **Direct Warehouse Connectivity:** Queries `fact_crypto_daily` joined with `dim_coins` over HTTPS using `databricks-sql-connector`, caching results for 5 minutes via `@st.cache_data(ttl=300)` for instant UI responsiveness.
+* **Custom Glassmorphism UI & Animated SVG Visuals:**
+  * **8 Executive KPI Cards:** Displays Top 200 Market Cap, 24h Global Volume, BTC Dominance %, 7D SMA Bullish Breadth %, 24h Top Gainer, 24h Top Loser, Median 24h Return %, and Highest Liquidity Ratio (`Vol/Mcap`).
+  * **Animated SVG Charts:** Built with custom HTML/SVG animations (`stroke-dashoffset` spline drawing and staggered bar transitions), including a Semi Circle Market Breadth Gauge, a Market Cap Tier Concentration Donut (Top 10 vs Rank 11 to 50 vs Rank 51 to 200), a Top 5 Gainers/Losers Bar Chart, and a Price vs. 7D SMA Trend Line.
+* **Token Optimized, Deterministic Groq AI Engine:**
+  * Sending 200 verbose JSON records to an LLM consumes over 25,000 tokens and exceeds free tier rate limits. The dashboard includes a dynamic context builder that compresses the snapshot into a compact pipe delimited table (under 1,800 tokens) containing overall breadth statistics, the top 20 assets, top gainers and losers, and any specific ticker matched in the user's question.
+  * Inference runs against Groq (`openai/gpt-oss-120b` with automatic fallback to `openai/gpt-oss-20b`) using `temperature=0.0`, `top_p=1.0`, `seed=42`, and `reasoning_effort="low"` paired with SHA 256 response caching so identical queries on the same snapshot always return consistent, data grounded answers.
 
 ---
 
@@ -83,22 +91,19 @@ PulseCrypto is an end to end data engineering pipeline and interactive market an
 
 | Layer | Technologies |
 | :--- | :--- |
-| **Extraction & API** | Python 3.12, `requests`, `boto3`, CoinGecko REST API |
-| **Cloud Storage** | Amazon S3 (Hive style date partitioned raw zone) |
-| **Lakehouse & ETL** | Databricks, PySpark, Delta Lake, Auto Loader (`cloudFiles`) |
-| **Automation** | GitHub Actions (Daily Cron) & Databricks Workflows |
-| **AI & LLM Layer** | Groq API (`openai/gpt-oss-120b`, `openai/gpt-oss-20b`) |
-| **Frontend & Cloud Host** | Streamlit Community Cloud, `databricks-sql-connector`, Pandas, Custom HTML/SVG |
+| **Data Extraction** | Python 3.12, `requests`, `boto3`, CoinGecko REST API |
+| **Cloud Storage** | Amazon S3 (Hive partitioned raw data lake) |
+| **Data Engineering & ETL** | Databricks, PySpark, Delta Lake, Auto Loader (`cloudFiles`) |
+| **Data Modeling** | Star Schema (`dim_coins`, `fact_crypto_daily`), PySpark Window Functions |
+| **AI & LLM Engine** | Groq API (`openai/gpt-oss-120b`, `openai/gpt-oss-20b`) |
+| **Frontend & Deployment** | Streamlit Community Cloud, `databricks-sql-connector`, Pandas, Custom HTML/SVG/CSS |
 
 ---
 
-## Repository Structure
+## Project Structure
 
 ```text
 Crypto_Data_Engineering_Project/
-├── .github/
-│   └── workflows/
-│       └── daily_ingest.yml          # GitHub Actions daily S3 extraction workflow
 ├── .streamlit/
 │   └── config.toml                   # Custom dark theme styling for Streamlit
 ├── src/
@@ -118,7 +123,7 @@ Crypto_Data_Engineering_Project/
 
 ---
 
-## Local Setup & Deployment Guide
+## Local Setup & Execution Guide
 
 ### 1. Clone the Repository
 ```bash
@@ -126,19 +131,21 @@ git clone [https://github.com/dishantjanii/Crypto_Data_Engineering_Project.git](
 cd Crypto_Data_Engineering_Project
 ```
 
-### 2. Create a Virtual Environment & Install Packages
+### 2. Create a Virtual Environment & Install Dependencies
 ```bash
 python -m venv .venv
-# Windows PowerShell:
+
+# Activate on Windows PowerShell:
 .venv\Scripts\Activate.ps1
-# macOS / Linux:
+
+# Activate on macOS / Linux:
 source .venv/bin/activate
 
 pip install -r requirements.txt
 ```
 
-### 3. Configure Local Environment Variables
-Create a `.env` file in the root directory (excluded from Git via `.gitignore`):
+### 3. Configure Environment Variables
+Create a `.env` file in the root directory (ignored by Git via `.gitignore`) and populate your credentials:
 ```ini
 AWS_ACCESS_KEY_ID=your_aws_access_key
 AWS_SECRET_ACCESS_KEY=your_aws_secret_key
@@ -152,18 +159,37 @@ DATABRICKS_TOKEN=your_databricks_pat_token
 GROQ_API_KEY=your_groq_api_key
 ```
 
-### 4. Run Locally
-```bash
-# 1. Extract today's snapshot to S3
-python src/extraction/ingest_coingecko.py
+### 4. Run the Pipeline End to End
+1. **Extract Raw Market Data to S3:**
+   ```bash
+   python src/extraction/ingest_coingecko.py
+   ```
+2. **Run Databricks Medallion Transformations:**
+   Execute `01_bronze_crypto.py`, `02_silver_crypto.py`, and `03_gold_crypto.py` sequentially in your Databricks workspace (or trigger your Databricks Workflow job) to update the Delta tables.
+3. **Launch the Local Streamlit Dashboard:**
+   ```bash
+   streamlit run src/dashboard/app.py
+   ```
 
-# 2. Execute 01_bronze_crypto.py, 02_silver_crypto.py, and 03_gold_crypto.py in Databricks
+---
 
-# 3. Start the Streamlit dashboard
-streamlit run src/dashboard/app.py
-```
+## Cloud Deployment (Streamlit Community Cloud)
 
-### 5. Cloud Deployment (Streamlit Community Cloud)
-1. Connect the GitHub repository (`dishantjanii/Crypto_Data_Engineering_Project`) on [share.streamlit.io](https://share.streamlit.io/) with main file path `src/dashboard/app.py`.
-2. Add `DATABRICKS_SERVER_HOSTNAME`, `DATABRICKS_HTTP_PATH`, `DATABRICKS_TOKEN`, and `GROQ_API_KEY` under **App Settings > Secrets** in TOML format.
-3. Add `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and `S3_BUCKET_NAME` under **GitHub Repository Settings > Secrets and variables > Actions** to enable daily automated ingestion.
+1. Push the repository to GitHub (`main` branch).
+2. Open [share.streamlit.io](https://share.streamlit.io/), select `dishantjanii/Crypto_Data_Engineering_Project`, and set the main file path to `src/dashboard/app.py`.
+3. Open **App Settings > Secrets** and add your Databricks and Groq credentials in TOML format:
+   ```toml
+   DATABRICKS_SERVER_HOSTNAME = "your-workspace.cloud.databricks.com"
+   DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/your-warehouse-id"
+   DATABRICKS_TOKEN = "dapi..."
+   GROQ_API_KEY = "gsk_..."
+   ```
+4. Deploy the app to publish your live public URL.
+
+---
+
+## Future Enhancements
+
+* Add 14 day Relative Strength Index (RSI) and 30 day moving averages to `fact_crypto_daily` as historical snapshots accumulate.
+* Implement automated data quality checks to validate record counts, null thresholds, and schema integrity before promoting data from Silver to Gold.
+* Add historical regime backtesting in the Streamlit UI to compare AI market outlook calls against subsequent 7 day returns.

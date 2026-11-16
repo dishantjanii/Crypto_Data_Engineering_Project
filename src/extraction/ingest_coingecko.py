@@ -66,7 +66,7 @@ def fetch_data():
 
 def upload_to_s3(data, file_name):
     today = datetime.now().strftime("%Y-%m-%d")
-    s3_key = f"raw/date={today}/{file_name}"
+    s3_key = f"raw/date={today}"
     s3_client.put_object(
         Bucket=S3_BUCKET_NAME,
         Key=s3_key,

@@ -1,0 +1,22 @@
+name: Daily Crypto S3 Ingestion
+on:
+  schedule:
+    - cron: "0 2 * * *" # Runs daily at 02:00 UTC (07:30 AM IST)
+  workflow_dispatch:    # Allows manual trigger from GitHub Actions tab
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests boto3 python-dotenv
+      - name: Run CoinGecko Ingestion to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+        run: python src/ingestion/ingest_coingecko.py

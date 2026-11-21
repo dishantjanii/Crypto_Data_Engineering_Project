@@ -418,14 +418,14 @@ def call_groq_deterministic(system_prompt: str, user_prompt: str) -> str:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def generate_deterministic_outlook(data_hash: str, compact_context: str) -> dict:
-      system_prompt = (
+    system_prompt = (
         "You are a Senior Quantitative Crypto Strategist. Rely EXCLUSIVELY on the provided market metrics. "
         "Never invent external news. Compute market regime objectively from breadth (Above_7D_SMA %), large-cap momentum "
         "(BTC, ETH, SOL), and VolToMcap liquidity ratios. Replace all placeholder values with actual figures from the data. "
         "Format executive_summary as 3 distinct bullet points separated by \\n so it renders cleanly across multiple lines. "
         "Respond with ONLY a valid raw JSON object—no markdown, no backticks, no prose."
     )
-    user_prompt = f"""
+    user_prompt = f""" 
     {compact_context}
 
     Output ONLY this exact raw JSON object with actual computed values:

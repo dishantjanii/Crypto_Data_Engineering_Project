@@ -418,34 +418,27 @@ def call_groq_deterministic(system_prompt: str, user_prompt: str) -> str:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def generate_deterministic_outlook(data_hash: str, compact_context: str) -> dict:
-  system_prompt = """You are a Senior Quantitative Crypto Strategist.
-
-    STRICT DATA RULES:
-    1. Rely EXCLUSIVELY on the provided market metrics. Never invent external news, catalysts, or prices.
-    2. Compute market regime objectively using ONLY:
-       - Market breadth (`Above_7D_SMA` %)
-       - Large-cap momentum (`BTC`, `ETH`, `SOL`)
-       - Liquidity ratios (`VolToMcap`)
-    3. Missing data: If a required metric or coin is absent, use "N/A" for strings or 0.0 for numbers.
-    
-    OUTPUT FORMAT RULES:
-    - Respond with ONLY a valid, raw JSON object.
-    - Do NOT wrap the output in markdown code blocks (no ```json or ```).
-    - Do NOT include introductory or concluding prose.
-    - Replace all placeholder values with actual computed values from the context."""
-    
-    user_prompt = f"""MARKET DATA:
+      system_prompt = (
+        "You are a Senior Quantitative Crypto Strategist. Rely EXCLUSIVELY on the provided market metrics. "
+        "Never invent external news. Compute market regime objectively from breadth (Above_7D_SMA %), large-cap momentum "
+        "(BTC, ETH, SOL), and VolToMcap liquidity ratios. Replace all placeholder values with actual figures from the data. "
+        "Format executive_summary as 3 distinct bullet points separated by \\n so it renders cleanly across multiple lines. "
+        "Respond with ONLY a valid raw JSON object—no markdown, no backticks, no prose."
+    )
+    user_prompt = f"""
     {compact_context}
-    
-    Analyze the market data above and return ONLY a raw JSON matching this exact schema:
+
+    Output ONLY this exact raw JSON object with actual computed values:
     {{
-        "market_bias": "<BULLISH | BEARISH | NEUTRAL>",
-        "confidence_score": <float between 0.00 and 1.00>,
-        "strongest_coin": "<TICKER_SYMBOL>",
-        "weakest_coin": "<TICKER_SYMBOL>",
-        "executive_summary": "<Exactly 3 concise sentences citing exact prices, 7D SMA alignment, and breadth %.>",
-        "risk_factor": "<1 short sentence identifying the primary volatility or VolToMcap liquidity risk.>"
-    }}"""
+        "market_bias": "BULLISH or BEARISH or NEUTRAL",
+        "confidence_score": 0.00,
+        "strongest_coin": "TICKER",
+        "weakest_coin": "TICKER",
+        "executive_summary": "• Sentence 1 with exact price and 7D SMA alignment.\\n• Sentence 2 with breadth % and large-cap momentum.\\n• Sentence 3 with VolToMcap liquidity comparison.",
+        "risk_factor": "1 short sentence identifying the primary volatility or concentration risk."
+    }}
+    """
+
 
     raw = call_groq_deterministic(system_prompt, user_prompt)
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE)
